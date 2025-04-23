@@ -1,0 +1,126 @@
+-- Temp table to store results
+IF OBJECT_ID('tempdb..#DatabaseUserInfo') IS NOT NULL DROP TABLE #DatabaseUserInfo;
+
+CREATE TABLE #DatabaseUserInfo (
+    DatabaseName NVARCHAR(128),
+    DatabaseSizeMB DECIMAL(18,2),
+    UserName NVARCHAR(128),
+    IsOrphaned BIT,
+    UserType NVARCHAR(60),
+    RoleName NVARCHAR(128),
+    TotalUsers INT,
+    AGName NVARCHAR(128),
+    PrimaryReplica NVARCHAR(128),
+    ListenerName NVARCHAR(128)
+);
+
+DECLARE @DBName NVARCHAR(128);
+DECLARE @SQL NVARCHAR(MAX);
+
+-- Databases: Standalone or part of AG where this node is Primary
+DECLARE db_cursor CURSOR FOR
+SELECT name
+FROM sys.databases
+WHERE state_desc = 'ONLINE'
+  AND database_id > 4
+  AND (
+        name NOT IN (SELECT database_name FROM sys.availability_databases_cluster)
+        OR EXISTS (
+            SELECT 1
+            FROM sys.availability_databases_cluster adc
+            JOIN sys.dm_hadr_availability_replica_states ars 
+                ON adc.group_id = ars.group_id
+            WHERE adc.database_name = sys.databases.name
+              AND ars.role_desc = 'PRIMARY'
+              AND ars.is_local = 1
+        )
+    );
+
+OPEN db_cursor;
+FETCH NEXT FROM db_cursor INTO @DBName;
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SET @SQL = N'
+    USE ' + QUOTENAME(@DBName) + N';
+
+    BEGIN TRY
+        WITH UserRoles AS (
+            SELECT 
+                dp.name AS UserName,
+                CASE 
+                    WHEN dp.name IN (''dbo'', ''guest'', ''INFORMATION_SCHEMA'', ''sys'') THEN 0
+                    WHEN dp.sid IS NULL THEN 1
+                    WHEN sp.sid IS NULL THEN 1
+                    ELSE 0 
+                END AS IsOrphaned,
+                dp.type_desc AS UserType,
+                ISNULL(rp.name, '''') AS RoleName
+            FROM sys.database_principals dp
+            LEFT JOIN sys.database_role_members drm 
+                ON dp.principal_id = drm.member_principal_id
+            LEFT JOIN sys.database_principals rp 
+                ON drm.role_principal_id = rp.principal_id
+            LEFT JOIN [master].sys.server_principals sp 
+                ON dp.sid = sp.sid
+            WHERE dp.type IN (''S'',''U'',''G'',''E'') 
+              AND dp.name NOT LIKE ''##%''
+        ),
+        DBSize AS (
+            SELECT SUM(size * 8.0 / 1024) AS SizeMB
+            FROM sys.database_files
+        ),
+        Total AS (
+            SELECT COUNT(*) AS TotalUsers 
+            FROM sys.database_principals 
+            WHERE type IN (''S'',''U'',''G'',''E'') 
+              AND sid IS NOT NULL AND name NOT LIKE ''##%''
+        ),
+        AGInfo AS (
+            SELECT 
+                adc.database_name,
+                ag.name AS AGName,
+                ar.replica_server_name AS PrimaryReplica,
+                agl.dns_name AS ListenerName
+            FROM sys.availability_databases_cluster adc
+            JOIN sys.availability_groups ag ON adc.group_id = ag.group_id
+            LEFT JOIN sys.dm_hadr_availability_replica_states ars 
+                ON ag.group_id = ars.group_id AND ars.role_desc = ''PRIMARY''
+            LEFT JOIN sys.availability_replicas ar ON ars.replica_id = ar.replica_id
+            LEFT JOIN sys.availability_group_listeners agl ON ag.group_id = agl.group_id
+        )
+        INSERT INTO #DatabaseUserInfo (
+            DatabaseName, DatabaseSizeMB, UserName, IsOrphaned, UserType, RoleName,
+            TotalUsers, AGName, PrimaryReplica, ListenerName
+        )
+        SELECT 
+            DB_NAME() AS DatabaseName,
+            (SELECT SizeMB FROM DBSize),
+            ur.UserName,
+            ur.IsOrphaned,
+            ur.UserType,
+            ur.RoleName,
+            (SELECT TotalUsers FROM Total),
+            ISNULL((SELECT TOP 1 AGName FROM AGInfo WHERE database_name = DB_NAME()), ''Standalone''),
+            ISNULL((SELECT TOP 1 PrimaryReplica FROM AGInfo WHERE database_name = DB_NAME()), @@SERVERNAME),
+            ISNULL((SELECT TOP 1 ListenerName FROM AGInfo WHERE database_name = DB_NAME()), ''Standalone'')
+        FROM UserRoles ur;
+    END TRY
+    BEGIN CATCH
+        PRINT ''Error accessing database: ' + @DBName + ''';
+    END CATCH;
+    ';
+
+    EXEC sp_executesql @SQL;
+
+    FETCH NEXT FROM db_cursor INTO @DBName;
+END
+
+CLOSE db_cursor;
+DEALLOCATE db_cursor;
+
+
+
+-- Final results
+SELECT * FROM #DatabaseUserInfo
+ORDER BY DatabaseName, UserName;
